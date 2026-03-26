@@ -11,7 +11,7 @@ std::optional<int64_t> parse_msf(const std::string& msf) {
     int mm = 0, ss = 0, ff = 0;
     if (std::sscanf(msf.c_str(), "%d:%d:%d", &mm, &ss, &ff) != 3)
         return std::nullopt;
-    if (ss < 0 || ss > 59 || ff < 0 || ff > 74)
+    if (ss < 0 || ss > 59 || ff < 0 || ff > 99)
         return std::nullopt;
     return static_cast<int64_t>(mm) * 60 * CD_FRAMES_PER_SECOND
          + static_cast<int64_t>(ss) * CD_FRAMES_PER_SECOND
