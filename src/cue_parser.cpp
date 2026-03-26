@@ -1,14 +1,16 @@
 #include "cue_parser.h"
 
 #include <algorithm>
-#include <array>
 #include <cctype>
 #include <cstdio>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
-#include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
 
 namespace mithrandir {
 
@@ -45,15 +47,38 @@ static std::optional<std::string> match_cmd(std::string_view line,
     return trim(line.substr(cmd.size()));
 }
 
-/// Run a command and capture stdout.
-static std::string exec_capture(const std::string& cmd) {
-    std::array<char, 4096> buf;
+/// Run a command and capture stdout via fork/execvp (no shell).
+static std::string exec_capture(const std::vector<std::string>& argv) {
+    if (argv.empty()) return {};
+
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return {};
+
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return {}; }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+
+        std::vector<const char*> c_argv;
+        for (auto& s : argv) c_argv.push_back(s.c_str());
+        c_argv.push_back(nullptr);
+        execvp(c_argv[0], const_cast<char* const*>(c_argv.data()));
+        _exit(127);
+    }
+
+    close(pipefd[1]);
     std::string result;
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(
-        popen(cmd.c_str(), "r"), pclose);
-    if (!pipe) return {};
-    while (fgets(buf.data(), buf.size(), pipe.get()))
-        result += buf.data();
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0)
+        result.append(buf, static_cast<size_t>(n));
+    close(pipefd[0]);
+    waitpid(pid, nullptr, 0);
     return result;
 }
 
@@ -217,13 +242,12 @@ std::optional<std::string> extract_embedded_cue(
     const std::filesystem::path& flac_path) {
     // Method 1: ffprobe Vorbis comment tag CUESHEET.
     {
-        std::string cmd =
-            "ffprobe -v error -show_entries format_tags=cuesheet "
-            "-of default=nokey=1:noprint_wrappers=1 " +
-            ("'" + flac_path.string() + "'");
-        // Escape single quotes in path.
-        // (Simplified — production code would use execvp.)
-        auto out = exec_capture(cmd);
+        auto out = exec_capture({
+            "ffprobe", "-v", "error",
+            "-show_entries", "format_tags=cuesheet",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            flac_path.string()
+        });
         auto trimmed = trim(out);
         if (!trimmed.empty() && trimmed.find("TRACK") != std::string::npos)
             return trimmed;
@@ -231,9 +255,10 @@ std::optional<std::string> extract_embedded_cue(
 
     // Method 2: metaflac --export-cuesheet-to=- (native FLAC CUESHEET block).
     {
-        std::string cmd =
-            "metaflac --export-cuesheet-to=- '" + flac_path.string() + "' 2>/dev/null";
-        auto out = exec_capture(cmd);
+        auto out = exec_capture({
+            "metaflac", "--export-cuesheet-to=-",
+            flac_path.string()
+        });
         auto trimmed = trim(out);
         if (!trimmed.empty() && trimmed.find("TRACK") != std::string::npos)
             return trimmed;

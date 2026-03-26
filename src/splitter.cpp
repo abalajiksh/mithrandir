@@ -1,46 +1,38 @@
 #include "splitter.h"
 
 #include <algorithm>
-#include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
 #include <iostream>
-#include <memory>
 #include <sstream>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
 
 namespace mithrandir {
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-/// Shell-escape a path for use in system().
-static std::string shell_escape(const std::filesystem::path& p) {
-    std::string s = p.string();
-    // Wrap in single quotes, escaping embedded single quotes.
-    std::string out = "'";
-    for (char c : s) {
-        if (c == '\'') out += "'\\''";
-        else           out += c;
-    }
-    out += "'";
-    return out;
-}
-
 /// Sanitise a string for use as a filename component.
 static std::string sanitise_filename(const std::string& s) {
     std::string out;
     out.reserve(s.size());
-    for (char c : s) {
+    for (unsigned char c : s) {
+        // Replace control bytes.
+        if (c < 0x20) { out += '_'; continue; }
         switch (c) {
             case '/': case '\\': case ':': case '*':
-            case '?': case '"':  case '<': case '>':
-            case '|':
+            case '?': case '"':  case '\'': case '<':
+            case '>': case '|':
                 out += '_';
                 break;
             default:
-                out += c;
+                out += static_cast<char>(c);
         }
     }
-    // Trim trailing dots/spaces (Windows compat, also just good hygiene).
+    // Trim trailing dots/spaces.
     while (!out.empty() && (out.back() == '.' || out.back() == ' '))
         out.pop_back();
     return out;
@@ -73,19 +65,107 @@ static std::string expand_pattern(const std::string& pattern,
     return sanitise_filename(result);
 }
 
-double probe_duration(const std::filesystem::path& audio_path) {
-    std::string cmd =
-        "ffprobe -v error -show_entries format=duration "
-        "-of default=nokey=1:noprint_wrappers=1 " +
-        shell_escape(audio_path);
+// ─── Process execution (no shell) ───────────────────────────────────
 
-    std::array<char, 256> buf;
+/// Run a command with arguments directly via fork/execvp.
+/// No shell involved — paths with quotes, spaces, unicode are all safe.
+/// Returns the exit code (0 on success).
+static int run_exec(const std::vector<std::string>& argv, bool verbose) {
+    if (argv.empty()) return -1;
+
+    if (verbose) {
+        std::cout << "  $";
+        for (auto& a : argv) {
+            bool needs_quote = (a.find(' ') != std::string::npos ||
+                                a.find('\'') != std::string::npos ||
+                                a.find('"') != std::string::npos);
+            if (needs_quote)
+                std::cout << " \"" << a << "\"";
+            else
+                std::cout << " " << a;
+        }
+        std::cout << "\n";
+    }
+
+    // Build C-style argv array for execvp.
+    std::vector<const char*> c_argv;
+    c_argv.reserve(argv.size() + 1);
+    for (auto& s : argv) c_argv.push_back(s.c_str());
+    c_argv.push_back(nullptr);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return -1;
+    }
+
+    if (pid == 0) {
+        // Child — exec directly, no shell.
+        execvp(c_argv[0], const_cast<char* const*>(c_argv.data()));
+        perror("execvp");
+        _exit(127);
+    }
+
+    // Parent — wait for child.
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid");
+        return -1;
+    }
+
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    return -1;
+}
+
+/// Run a command and capture its stdout via pipe + fork/execvp.
+static std::string exec_capture(const std::vector<std::string>& argv) {
+    if (argv.empty()) return {};
+
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return {};
+
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return {}; }
+
+    if (pid == 0) {
+        // Child: stdout → pipe, stderr → /dev/null.
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+
+        std::vector<const char*> c_argv;
+        for (auto& s : argv) c_argv.push_back(s.c_str());
+        c_argv.push_back(nullptr);
+        execvp(c_argv[0], const_cast<char* const*>(c_argv.data()));
+        _exit(127);
+    }
+
+    // Parent: read stdout from pipe.
+    close(pipefd[1]);
     std::string out;
-    std::unique_ptr<FILE, decltype(&pclose)> pipe(
-        popen(cmd.c_str(), "r"), pclose);
-    if (!pipe) return 0.0;
-    while (fgets(buf.data(), buf.size(), pipe.get()))
-        out += buf.data();
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0)
+        out.append(buf, static_cast<size_t>(n));
+    close(pipefd[0]);
+
+    waitpid(pid, nullptr, 0);
+    return out;
+}
+
+// ─── Probing ────────────────────────────────────────────────────────
+
+double probe_duration(const std::filesystem::path& audio_path) {
+    auto out = exec_capture({
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=nokey=1:noprint_wrappers=1",
+        audio_path.string()
+    });
     try { return std::stod(out); }
     catch (...) { return 0.0; }
 }
@@ -101,7 +181,6 @@ std::vector<SplitResult> split_tracks(
     namespace fs = std::filesystem;
     std::vector<SplitResult> results;
 
-    // Ensure output directory exists.
     if (!opts.dry_run)
         fs::create_directories(opts.output_dir);
 
@@ -114,7 +193,6 @@ std::vector<SplitResult> split_tracks(
         // Resolve the source audio path.
         fs::path src_path = base_dir / cue_file.filename;
         if (!fs::exists(src_path)) {
-            // Try common alternate extensions.
             for (auto ext : {".flac", ".wav", ".wv", ".ape", ".mp3"}) {
                 auto alt = src_path;
                 alt.replace_extension(ext);
@@ -130,7 +208,6 @@ std::vector<SplitResult> split_tracks(
             continue;
         }
 
-        // Probe total duration for calculating the last track's end.
         double total_duration = probe_duration(src_path);
 
         for (size_t ti = 0; ti < cue_file.tracks.size(); ++ti) {
@@ -143,16 +220,14 @@ std::vector<SplitResult> split_tracks(
             double start_sec = frames_to_seconds(track.index01_frames);
             double end_sec   = 0.0;
 
-            // Pregap handling: if Prepend mode, start from INDEX 00.
             if (opts.pregap_mode == SplitOptions::PregapMode::Prepend &&
                 track.index00_frames.has_value()) {
                 start_sec = frames_to_seconds(*track.index00_frames);
             }
 
-            // End time = next track's start (or INDEX 00 if AppendPrev).
             bool is_last_in_file = (ti + 1 >= cue_file.tracks.size());
             if (is_last_in_file) {
-                end_sec = total_duration;  // to EOF
+                end_sec = total_duration;
             } else {
                 const auto& next = cue_file.tracks[ti + 1];
                 if (opts.pregap_mode == SplitOptions::PregapMode::AppendPrev &&
@@ -181,31 +256,31 @@ std::vector<SplitResult> split_tracks(
                 continue;
             }
 
-            // ── Build ffmpeg command ────────────────────────────
-            std::ostringstream cmd;
-            cmd << "ffmpeg -y -v error"
-                << " -i " << shell_escape(src_path)
-                << " -ss " << seconds_to_ffmpeg_ts(start_sec);
+            // ── Build ffmpeg argv (no shell involved) ───────────
+            std::vector<std::string> argv = {
+                "ffmpeg", "-y", "-v", "error",
+                "-i", src_path.string(),
+                "-ss", seconds_to_ffmpeg_ts(start_sec)
+            };
 
-            if (!is_last_in_file)
-                cmd << " -to " << seconds_to_ffmpeg_ts(end_sec);
-
-            if (opts.output_format == "flac") {
-                cmd << " -c:a flac"
-                    << " -compression_level " << opts.flac_compression;
-            } else if (opts.output_format == "wav") {
-                cmd << " -c:a pcm_s16le";
-            } else {
-                // Fallback: let ffmpeg choose codec from extension.
-                // (Shouldn't happen with validated options.)
+            if (!is_last_in_file) {
+                argv.push_back("-to");
+                argv.push_back(seconds_to_ffmpeg_ts(end_sec));
             }
 
-            cmd << " " << shell_escape(out_path);
+            if (opts.output_format == "flac") {
+                argv.push_back("-c:a");
+                argv.push_back("flac");
+                argv.push_back("-compression_level");
+                argv.push_back(std::to_string(opts.flac_compression));
+            } else if (opts.output_format == "wav") {
+                argv.push_back("-c:a");
+                argv.push_back("pcm_s16le");
+            }
 
-            if (opts.verbose)
-                std::cout << "  $ " << cmd.str() << "\n";
+            argv.push_back(out_path.string());
 
-            int rc = std::system(cmd.str().c_str());
+            int rc = run_exec(argv, opts.verbose);
             if (rc != 0) {
                 results.push_back({track.number, out_path, false,
                     "ffmpeg exited with code " + std::to_string(rc)});
