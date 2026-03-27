@@ -26,10 +26,7 @@ static std::string trim(std::string_view sv) {
 
 /// Remove surrounding quotes if present.
 static std::string unquote(std::string_view sv) {
-    while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.front())))
-        sv.remove_prefix(1);
-    while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.back())))
-        sv.remove_suffix(1);
+    sv = trim(sv);
     if (sv.size() >= 2 && sv.front() == '"' && sv.back() == '"')
         sv = sv.substr(1, sv.size() - 2);
     return std::string(sv);

@@ -20,8 +20,6 @@ static std::string sanitise_filename(const std::string& s) {
     std::string out;
     out.reserve(s.size());
     for (unsigned char c : s) {
-        // Preserve high bytes for UTF-8 and extended ASCII (e.g. Latin-1)
-        if (c >= 0x80) { out += static_cast<char>(c); continue; }
         // Replace control bytes.
         if (c < 0x20) { out += '_'; continue; }
         switch (c) {
